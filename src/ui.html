@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bear Den Bridge</title>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --fg:#d8dee6; --dim:#7a8694;
+          --ok:#3fb950; --bad:#f85149; --accent:#4493f8; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,sans-serif;
+         margin:0; padding:16px; max-width:860px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h1 span { color:var(--dim); font-weight:normal; font-size:13px; }
+  .panel { background:var(--panel); border-radius:8px; padding:12px 14px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .badge { padding:2px 10px; border-radius:10px; font-size:12px; }
+  .badge.ok { background:var(--ok); color:#04170a; }
+  .badge.bad { background:var(--bad); color:#210404; }
+  .badge.idle { background:#3d444d; color:var(--fg); }
+  button { background:#2d333b; color:var(--fg); border:1px solid #444c56;
+           border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  button:hover { background:#3d444d; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.good { border-color:var(--ok); color:var(--ok); }
+  input[type=text] { background:#0d1117; color:var(--fg); border:1px solid #444c56;
+                     border-radius:6px; padding:5px 8px; font-size:13px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:4px 8px; border-bottom:1px solid #2d333b; }
+  th { color:var(--dim); font-weight:normal; }
+  td.ts { color:var(--dim); white-space:nowrap; }
+  td.kind { white-space:nowrap; }
+  .k-rf_out { color:var(--accent); }
+  .k-mesh_msg { color:var(--ok); }
+  .k-mesh_join { color:#d29922; }
+  .k-rejected { color:var(--bad); }
+  #token-row { margin-bottom:14px; }
+  .muted { color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+<h1>🐻 Bear Den Bridge <span>mesh ↔ XMPP</span></h1>
+
+<div class="panel" id="token-row">
+  <div class="row">
+    <input type="text" id="token" placeholder="admin token" size="24">
+    <button onclick="saveToken()">Save token</button>
+    <span class="muted" id="auth-state"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <span>Kill switch:</span><span id="ks" class="badge idle">…</span>
+    <button id="ks-btn" onclick="toggleKill()">…</button>
+    <span class="muted">|</span>
+    <span>Users: <b id="usercount">…</b></span>
+  </div>
+</div>
+
+<div class="panel">
+  <b>Send to mesh</b>
+  <div class="row" style="margin-top:8px">
+    <input type="text" id="send-name" placeholder="name" size="8" value="admin">
+    <input type="text" id="send-text" placeholder="message (clipped to 180 chars)" size="48">
+    <button onclick="doSend()">Send</button>
+  </div>
+</div>
+
+<div class="panel">
+  <b>Internet users</b>
+  <table id="users"><thead><tr><th>Backend</th><th>Name</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
+  <div class="muted" id="no-users">No internet users yet.</div>
+</div>
+
+<div class="panel">
+  <b>Events</b>
+  <table id="events"><thead><tr><th>Time</th><th>Kind</th><th>Source</th><th>Text</th></tr></thead><tbody></tbody></table>
+</div>
+
+<script>
+let TOKEN = sessionStorage.getItem('bd_token') || '';
+const $ = id => document.getElementById(id);
+if (TOKEN) $('token').value = TOKEN;
+
+function saveToken() {
+  TOKEN = $('token').value.trim();
+  sessionStorage.setItem('bd_token', TOKEN);
+  refresh();
+}
+
+async function api(path, opts) {
+  const h = { 'Content-Type': 'application/json' };
+  if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
+  const r = await fetch(path, { headers: h, ...opts });
+  if (r.status === 401) { $('auth-state').textContent = 'unauthorized'; throw new Error('401'); }
+  $('auth-state').textContent = 'ok';
+  return r.json();
+}
+
+function tsfmt(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+}
+
+async function refresh() {
+  try {
+    const [status, users, events] = await Promise.all([
+      api('/status'), api('/users'), api('/events?limit=100')
+    ]);
+    $('ks').textContent = status.kill_switch ? 'ENGAGED' : 'clear';
+    $('ks').className = 'badge ' + (status.kill_switch ? 'bad' : 'ok');
+    $('ks-btn').textContent = status.kill_switch ? 'Release' : 'Engage';
+    $('ks-btn').className = status.kill_switch ? 'good' : 'danger';
+    $('usercount').textContent = users.length;
+
+    const ub = $('users').querySelector('tbody');
+    ub.innerHTML = users.map(u => {
+      const [backend, name] = u.key.split(':');
+      const st = u.state === 'approved' ? '<span class="badge ok">approved</span>'
+               : u.state === 'banned' ? '<span class="badge bad">banned</span>'
+               : '<span class="badge idle">pending</span>';
+      const btn = u.state === 'approved'
+        ? `<button class="danger" onclick="setUser('${backend}','${name}','ban')">Ban</button>`
+        : `<button class="good" onclick="setUser('${backend}','${name}','approve')">Approve</button>` +
+          `<button class="danger" onclick="setUser('${backend}','${name}','deny')">Deny</button>`;
+      return `<tr><td>${backend}</td><td>${name}</td><td>${st}</td><td>${btn}</td></tr>`;
+    }).join('');
+    $('no-users').style.display = users.length ? 'none' : 'block';
+
+    const eb = $('events').querySelector('tbody');
+    eb.innerHTML = events.map(e =>
+      `<tr><td class="ts">${tsfmt(e.ts)}</td><td class="kind k-${e.kind}">${e.kind}</td>` +
+      `<td class="ts">${e.source}</td><td>${e.text.replace(/</g,'&lt;')}</td></tr>`).join('');
+  } catch (e) {}
+}
+
+async function toggleKill() {
+  const s = await api('/status');
+  const on = s.kill_switch ? 'off' : 'on';
+  await api('/killswitch/' + on, { method: 'POST' });
+  refresh();
+}
+
+async function setUser(backend, name, action) {
+  await api(`/users/${backend}/${name}/${action}`, { method: 'POST' });
+  refresh();
+}
+
+async function doSend() {
+  const text = $('send-text').value.trim();
+  if (!text) return;
+  const name = $('send-name').value.trim() || 'admin';
+  const r = await api('/send', { method: 'POST', body: JSON.stringify({ name, text }) });
+  if (!r.ok) alert(r.error || 'send failed');
+  $('send-text').value = '';
+  refresh();
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

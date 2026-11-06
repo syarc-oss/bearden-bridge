@@ -1,0 +1,6 @@
+/target
+/bridge.db
+media/
+bridge-au.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,34 @@
+[Unit]
+Description=Bear Den MeshCore bridge daemon
+After=network.target
+
+[Service]
+Type=simple
+User=bridge
+ExecStart=/usr/local/bin/bearden-bridge
+Restart=always
+RestartSec=3
+Environment=BEARDEN_PORT=/dev/bearden
+Environment=BEARDEN_DB=/var/lib/bearden-bridge/bridge.db
+Environment=BEARDEN_API=127.0.0.1:8095
+# Admin API token (required for remote access; also accepted as ?token=).
+Environment=BEARDEN_ADMIN_TOKEN=change-me
+# XMPP backend (optional)
+#Environment=BEARDEN_XMPP_JID=bridge@example.net
+#Environment=BEARDEN_XMPP_PASSWORD=change-me
+#Environment=BEARDEN_XMPP_ROOM=mesh@conference.example.net
+#Environment=BEARDEN_XMPP_NICK=bridge
+# Matrix backend (optional)
+#Environment=BEARDEN_MATRIX_HOMESERVER=https://matrix.example.net
+#Environment=BEARDEN_MATRIX_USER=bridge
+#Environment=BEARDEN_MATRIX_PASSWORD=change-me
+#Environment=BEARDEN_MATRIX_ROOM=!roomid:example.net
+# Tunnel initial defaults (optional; runtime-configurable via the admin
+# API /tunnel/config, which persists to the DB)
+#Environment=BEARDEN_TUNNEL_PEER=http://192.168.1.20:8095
+#Environment=BEARDEN_TUNNEL_TOKEN=change-me
+#Environment=BEARDEN_TUNNEL_TAG=US
+#Environment=BEARDEN_TUNNEL_PEER_TAG=AU
+
+[Install]
+WantedBy=multi-user.target
