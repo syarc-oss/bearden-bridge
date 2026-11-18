@@ -1,5 +1,12 @@
 # bearden-bridge
 
+MeshCore LoRa mesh bridge: connects a MeshCore room-server node to Matrix and
+XMPP, relays Open TAK voice (Codec2) and photo (AV1) clips between meshes, and
+links two isolated meshes over the internet with a store-and-forward tunnel —
+no cloud, no vendor server. A self-hosted alternative for off-grid, ham-radio,
+and emergency-preparedness communication (complements Meshtastic-style meshes;
+works alongside MeshCore companion apps like Open TAK).
+
 Standalone daemon bridging the Bear Den MeshCore room server (serial,
 /dev/bearden) to internet messaging backends.
 
