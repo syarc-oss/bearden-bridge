@@ -99,6 +99,11 @@ async fn main() -> Result<()> {
             cfg.pace_ms
         );
         let f = fwd.clone();
+        let f2 = fwd.clone();
+        let media_for_hook = media_mgr.clone();
+        media_for_hook.set_complete_hook(Box::new(move |sid, kind, mode, buf, chan| {
+            f2.on_clip_complete(sid, kind, mode, buf, chan);
+        }));
         std::thread::spawn(move || f.run());
     }
 

@@ -147,6 +147,13 @@ pub struct MediaManager {
     /// console's /platforms/meshcore/media/intake so its UI shows the full
     /// clip (the console cannot 0x72-fetch missing parts itself).
     console: Option<(String, String)>,
+    /// Fired on every NEW completed clip (not duplicate re-completions),
+    /// so the channel forwarder can forward complete clips only instead of
+    /// re-flooding partial packet streams (mid-clip link loss = corruption
+    /// at the far end otherwise). Set after construction (forwarder holds
+    /// an Arc to this manager, so a plain Arc cycle is fine for a process
+    /// that lives forever).
+    complete_hook: Mutex<Option<Box<dyn Fn(&str, &str, u32, &[u8], &str) + Send + Sync>>>,
     /// Ring buffer of recently ingested raw packets (post salt-strip) for
     /// live debugging via GET /media/debug — no env or disk perms needed.
     ring: std::sync::Mutex<std::collections::VecDeque<(u32, u32, u8, usize, String, std::time::SystemTime)>>,
@@ -163,8 +170,14 @@ impl MediaManager {
             fetch_gate: Mutex::new(HashMap::new()),
             fetch_sink: Mutex::new(None),
             console,
+            complete_hook: Mutex::new(None),
             ring: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Install the completion hook (see `complete_hook`).
+    pub fn set_complete_hook(&self, hook: Box<dyn Fn(&str, &str, u32, &[u8], &str) + Send + Sync>) {
+        *self.complete_hook.lock().unwrap() = Some(hook);
     }
 
     /// Install the sender used for outgoing 0x72 fetch requests.
@@ -433,13 +446,17 @@ impl MediaManager {
     /// they emit the announce plus only the first few packets and serve the
     /// rest only when a receiver sends a 0x72 fetch. So:
     ///  - total known (from a VE3/VM1/VI1 announce): finalize ONLY when every
-    ///    index 0..total is present; otherwise send a 0x72 fetch (at most 8,
-    ///    spaced >= 10s) for the missing indices.
+    ///    index 0..total is present; otherwise send a 0x72 fetch (at most 24,
+    ///    spaced >= 130s: two bridges fetch the same clip, combined stays under senders' 1/min answer limit)
     ///  - total unknown: fall back to the old contiguous-run heuristic, but
     ///    never finalize a session that carries parts above the run.
     fn sweep_idle(&self) -> Vec<(u32, Session)> {
-        const FETCH_IDLE_SECS: u64 = 10;
-        const MAX_FETCHES: u32 = 8;
+        // Senders rate-limit fetch answers to ~1/minute (Open TAK desktop:
+        // "answering it at most once a minute"), so asking faster is wasted
+        // airtime and burns their rate limit. 65s spacing, 10 rounds (~11 min
+        // of retry window for marginal RF links).
+        const FETCH_IDLE_SECS: u64 = 130;
+        const MAX_FETCHES: u32 = 24;
         const MAX_FETCH_INDICES: usize = 48;
         let mut out = Vec::new();
         let mut fetches: Vec<(u32, Vec<u8>, String)> = Vec::new();
@@ -531,8 +548,8 @@ impl MediaManager {
                 .fetch_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(u64::MAX);
-            if !missing.is_empty() && s.fetches < MAX_FETCHES {
-                if since_fetch >= FETCH_IDLE_SECS {
+            if !missing.is_empty() {
+                if s.fetches < MAX_FETCHES && since_fetch >= FETCH_IDLE_SECS {
                     let mut m = missing.clone();
                     let r = m[(s.fetches as usize) % m.len()];
                     m.push(r);
@@ -547,19 +564,29 @@ impl MediaManager {
                     s.fetches += 1;
                     fetches.push((sid, wire, s.chan.clone()));
                 }
-                if s.last_seen.elapsed().as_secs() > 600 {
-                    s.total = if run > 0 {
-                        run
-                    } else {
-                        max_idx + 1
-                    };
+                // Budget spent with gaps still below the highest observed
+                // index: the clip is INCOMPLETE and assembling it would
+                // produce a garbled partial (055a8ed9 class: finalized a
+                // 0-8 run while idx 17 existed). Drop it — late parts can
+                // still reopen the session while it survives in the map.
+                if s.fetches >= MAX_FETCHES {
                     s.done = true;
-                    out.push((sid, s.clone()));
+                    s.stored_max = max_idx + 1;
+                    self.store.log_event(
+                        "media",
+                        "mesh",
+                        &format!(
+                            "dropping incomplete clip {sid:08x} (run {} of {}+ observed, fetch budget spent)",
+                            run, max_idx + 1
+                        ),
+                    );
+                    eprintln!(
+                        "bearden: media {sid:08x} incomplete (run {run}, max idx {max_idx}) — dropped, not forwarded"
+                    );
                 }
                 continue;
             }
-            // Contiguous observed window (or fetch budget spent): finalize
-            // the best contiguous run.
+            // Contiguous observed window: finalize the full run.
             s.total = if run > 0 {
                 run
             } else {
@@ -632,6 +659,9 @@ impl MediaManager {
                 );
                 eprintln!("bearden: media session {sid_hex} complete ({size} bytes)");
                 self.push_console(&sid_hex, kind, mode, total, &fname, &buf, &sess.chan, &sess.chan2);
+                if let Some(hook) = self.complete_hook.lock().unwrap().as_ref() {
+                    hook(&sid_hex, kind, mode, &buf, if sess.chan.is_empty() { "bears" } else { &sess.chan });
+                }
             }
             Err(e) => {
                 self.store.media_error(&sid_hex);
@@ -732,9 +762,13 @@ impl MediaManager {
     /// name prefixes ("Bear Den2: VE3:...") — jade-on-mesh's own parser does
     /// not, so we cannot rely on anyone else having parsed it.
     pub fn register_envelope(&self, text: &str, chan: &str) {
-        let Some(at) = text.find("VE3:").or_else(|| text.find("VM1:")) else {
+        let Some(at) = ["VE3:", "VM1:", "VI1:"]
+            .iter()
+            .find_map(|v| text.find(v))
+        else {
             return;
         };
+        let verb = &text[at..at + 3];
         let fields: Vec<&str> = text[at..]
             .split_whitespace()
             .next()
@@ -760,7 +794,7 @@ impl MediaManager {
         }
         let mut map = self.sessions.lock().unwrap();
         let entry = map.entry(sid).or_insert_with(|| Session {
-            kind: if text.contains("VI1:") { "photo".into() } else { "voice".into() },
+            kind: if verb == "VI1" { "photo".into() } else { "voice".into() },
             mode: 0,
             total: 0,
             chan: chan.to_string(),
@@ -774,6 +808,9 @@ impl MediaManager {
             fetches: 0,
         });
         let s = &mut *entry;
+        if !s.done && verb == "VI1" {
+            s.kind = "photo".into();
+        }
         if !s.done && s.mode == 0 {
             s.mode = mode;
         }

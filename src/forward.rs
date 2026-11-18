@@ -58,6 +58,17 @@ pub fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
+/// Lowercase base36 (VE3/VM1/VI1 announce fields).
+fn b36(mut v: u32) -> String {
+    if v == 0 { return "0".into(); }
+    let mut s = String::new();
+    while v > 0 {
+        s.insert(0, char::from_digit(v % 36, 36).unwrap());
+        v /= 36;
+    }
+    s
+}
+
 pub struct Forwarder {
     pub store: Arc<Store>,
     pub serial: Arc<SerialLink>,
@@ -123,25 +134,61 @@ impl Forwarder {
         self.store.admit_forward_dedup(key, now as i64)
     }
 
-    /// Called from the serial reader for every media packet event.
-    pub fn handle_media(&self, ev: &BridgeLine, payload: &[u8]) {
+    /// Called from the serial reader for every media packet event. With
+    /// complete-clip forwarding we do NOT queue the packet — the local
+    /// reassembler collects it, and `on_clip_complete` fires when the whole
+    /// clip is in hand (partial streams are never re-flooded, so a mid-clip
+    /// link loss can no longer corrupt the far end).
+    pub fn handle_media(&self, ev: &BridgeLine, _payload: &[u8]) {
         let cfg = self.config();
         if !cfg.enabled || ev.ch != cfg.in_idx {
             return;
         }
-        let key = fnv1a(payload);
-        if !self.admit(key) {
-            return; // already forwarded (loop guard) or duplicate
+        // Loop guard for legacy per-packet rows still in the queue: nothing
+        // to do here anymore; kept as a no-op seam for the serial reader.
+    }
+
+    /// Called by the media manager when a NEW clip completes. If it arrived
+    /// on our in-channel, queue the complete bytes as one "clip" row; the
+    /// drain re-chunks it under a fresh sid with its own announce.
+    pub fn on_clip_complete(&self, sid_hex: &str, kind: &str, mode: u32, buf: &[u8], chan: &str) {
+        let cfg = self.config();
+        if !cfg.enabled || ch_word(cfg.in_idx) != Some(chan) {
+            return;
         }
-        let b64 = crate::media::b64_encode(payload);
-        self.store.forward_enqueue("media", &b64);
-        self.store.log_event("forward", "mesh", &format!("queued media packet ch={} {}", ev.ch, &b64[..b64.len().min(16)]));
+        // Echo of a clip we forwarded ourselves reassembles to the same
+        // bytes — one fnv admit key stops the ping-pong permanently.
+        let key = fnv1a(buf) | 2;
+        if !self.admit(key) {
+            return;
+        }
+        if buf.is_empty() || buf.len() > crate::media::MAX_CLIP_BYTES {
+            self.store.log_event("forward", "mesh", &format!("clip {sid_hex} too large to forward ({} B)", buf.len()));
+            return;
+        }
+        let payload = serde_json::json!({
+            "b64": crate::media::b64_encode(buf),
+            "kind": kind,
+            "mode": mode,
+        });
+        self.store.forward_enqueue("clip", &payload.to_string());
+        self.store.log_event(
+            "forward",
+            "mesh",
+            &format!("queued complete {kind} clip {sid_hex} ({} B) ch={chan}", buf.len()),
+        );
     }
 
     /// Called from the serial reader for every channel text event.
     pub fn handle_text(&self, ev: &BridgeLine) {
         let cfg = self.config();
         if !cfg.enabled || ev.ch != cfg.in_idx || ev.text.is_empty() {
+            return;
+        }
+        // Media announces are not forwarded as text: complete-clip
+        // forwarding emits its OWN announce for the fresh sid. Forwarding
+        // the original would advertise a sid whose packets never come.
+        if ev.text.contains("VE3:") || ev.text.contains("VM1:") || ev.text.contains("VI1:") {
             return;
         }
         // Loop guard: each RF hop prepends "<sender>: " to the text, so a
@@ -157,24 +204,67 @@ impl Forwarder {
         self.store.log_event("forward", "mesh", &format!("queued text ch={} {} bytes", ev.ch, ev.text.len()));
     }
 
+    /// Forward a COMPLETE clip: re-chunk under a fresh sid (single clean
+    /// packet class — no dual-packetization mixing), announce it, and run
+    /// one paced salted pass with the packet-0 pre-send settle. The whole
+    /// thing goes through the serial TX path so /media/tx records it.
+    fn send_complete_clip(&self, payload_json: &str, out: &str) -> Result<(), String> {
+        let v: serde_json::Value =
+            serde_json::from_str(payload_json).map_err(|e| format!("bad clip json: {e}"))?;
+        let data = crate::media::b64_decode(v["b64"].as_str().unwrap_or(""))
+            .ok_or("bad b64 in clip row")?;
+        let mode = v["mode"].as_u64().unwrap_or(1) as u32;
+        let kind = v["kind"].as_str().unwrap_or("voice").to_string();
+        let (sid, packets) =
+            crate::media::MediaManager::chunk_outbound(&data, mode).ok_or("clip too large")?;
+        let sid_hex = format!("{sid:08x}");
+        let n = packets.len();
+        let pace = self.config().pace_ms.max(crate::media::SEND_PACE_MS);
+        let bitrate = match mode {
+            1 => 1200, 2 => 2400, 3 => 1300, 4 => 1400, 5 => 1600, 6 => 3200, _ => 700,
+        };
+        let dur = if mode == 40 { 100 } else { (data.len() as u64 * 8 / bitrate).max(1) as u32 };
+        let verb = match mode { 40 => "VI1", 32 => "VM1", _ => "VE3" };
+        let announce = format!("{}:{}:{}:{}:{}", verb, b36(sid), b36(mode), b36(n as u32), b36(dur));
+        self.media.record_outbound(sid, &packets); // answer 0x72 fetches for the forwarded copy
+        self.media.register_envelope(&announce, out); // echo of our own flood completes locally
+        self.serial.send_text(&announce, out).map_err(|e| e.to_string())?;
+        std::thread::sleep(Duration::from_secs(2)); // let the announce land first
+        // First radio2 datagram after the announce is often dropped; send
+        // packet 0 alone and let the radio settle before the paced pass.
+        self.serial
+            .send_media(&crate::media::resalt(&packets[0]), out)
+            .map_err(|e| e.to_string())?;
+        std::thread::sleep(Duration::from_secs(2));
+        for p in &packets {
+            self.serial
+                .send_media(&crate::media::resalt(p), out)
+                .map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(pace));
+        }
+        self.store.log_event(
+            "forward",
+            "mesh",
+            &format!("forwarded {kind} clip {sid_hex}: {n} packets on {out}"),
+        );
+        Ok(())
+    }
+
     /// Paced drain loop; run on a dedicated thread.
     pub fn run(self: Arc<Self>) {
         loop {
             let cfg = self.config();
             if let Some((id, kind, payload)) = self.store.forward_pop() {
                 let out = ch_word(cfg.out_idx).unwrap_or("bears2");
-                let res = if kind == "media" {
-                    // Send once with a fresh salt: the originator already
-                    // floods two lossy passes and MeshCore drops
-                    // byte-identical retransmits; receivers dedup media
-                    // parts by sid+index and 0x72-fetch any gap (we cache
-                    // forwarded parts below to answer those).
+                let res = if kind == "clip" {
+                    self.send_complete_clip(&payload, out)
+                } else if kind == "media" {
+                    // Legacy per-packet rows (queued before this build):
+                    // send once with a fresh salt and keep the fetch cache.
                     crate::media::b64_decode(&payload)
                         .ok_or_else(|| "bad b64".to_string())
                         .and_then(|p| {
                             self.serial.send_media(&crate::media::resalt(&p), out).map_err(|e| e.to_string())?;
-                            // Cache forwarded parts (keyed by sid) so 0x72
-                            // fetches for the forwarded clip can be answered.
                             if p.len() >= 6 {
                                 let sid = u32::from_be_bytes([p[1], p[2], p[3], p[4]]);
                                 self.media.merge_outbound(sid, vec![p]);

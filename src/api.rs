@@ -51,6 +51,7 @@ pub fn router(
         .route("/media/{id}/file", get(media_file))
         .route("/media/send", post(media_send))
         .route("/media/debug", get(media_debug))
+        .route("/media/tx", get(media_tx))
         .route("/killswitch/{on}", post(killswitch))
         .route("/tunnel/flush", post(tunnel_flush))
         .route("/tunnel/config", get(tunnel_config_get).post(tunnel_config_set))
@@ -512,6 +513,32 @@ async fn media_debug(State((_, _, _, _, media, _)): State<ApiState>) -> Json<Val
     Json(media.debug_dump())
 }
 
+/// Outbound serial writes (media packets, fetch requests/answers, text
+/// announces) — newest last, cap 2000. Complements /media/debug (RX only).
+async fn media_tx(State(_): State<ApiState>) -> Json<Value> {
+    let ring = crate::serial::TX_RING.lock().unwrap();
+    let recs: Vec<Value> = ring
+        .iter()
+        .map(|r| {
+            let ts = r
+                .ts
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            json!({
+                "ts": ts,
+                "kind": r.kind,
+                "chan": r.chan,
+                "sid": r.sid.map(|s| format!("{s:08x}")),
+                "idx": r.idx,
+                "len": r.len,
+                "text": r.text,
+            })
+        })
+        .collect();
+    Json(json!({ "tx": recs }))
+}
+
 async fn media_file(
     State((store, _, _, _, media, _)): State<ApiState>,
     Path(id): Path<i64>,
@@ -526,7 +553,7 @@ async fn media_file(
 /// Chunk a base64 clip into paced radio2 media packets. Returns
 /// immediately; completion is observable via GET /media on the peers.
 async fn media_send(
-    State((store, egress, _, _, media, _)): State<ApiState>,
+    State((store, egress, _, _, media, forward)): State<ApiState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     if store.kill_switch() {
@@ -607,11 +634,29 @@ async fn media_send(
     // that echo session completes at full size instead of early-finalizing.
     media.register_envelope(&announce, chan);
     // Self-originated floods are never echoed back as serial receive events,
-    // so the forwarder would never see them — enqueue explicitly so the clip
-    // (and its announce) also lands on the forwarder's out channel.
-    store.forward_enqueue("text", &announce);
-    for p in &packets {
-        store.forward_enqueue("media", &crate::media::b64_encode(p));
+    // so the complete-hook would never fire. Only enqueue a forward row when
+    // the clip was sent on the forwarder's IN channel (i.e. cross-channel
+    // relay is actually needed); enqueueing unconditionally re-flooded every
+    // send a second time under a fresh sid on the out channel — even when
+    // that was the SAME channel, doubling airtime and producing duplicate
+    // clip postings on Open TAK clients.
+    let needs_forward = forward
+        .as_ref()
+        .map(|f| {
+            let cfg = f.config();
+            cfg.enabled && crate::forward::ch_word(cfg.in_idx) == Some(chan)
+        })
+        .unwrap_or(false);
+    if needs_forward {
+        store.forward_enqueue(
+        "clip",
+        &serde_json::json!({
+            "b64": crate::media::b64_encode(&data),
+            "kind": kind,
+            "mode": mode,
+        })
+        .to_string(),
+        );
     }
     tokio::spawn(async move {
         if let Err(e) = serial.send_text(&announce, chan) {

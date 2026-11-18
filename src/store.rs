@@ -89,6 +89,9 @@ impl Store {
         let _ = db.execute_batch(
             "CREATE TABLE IF NOT EXISTS forward_dedup (k INTEGER PRIMARY KEY, ts INTEGER NOT NULL);",
         );
+        let _ = db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tunnel_outbox (k TEXT PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL);",
+        );
         Ok(Store {
             db: Mutex::new(db),
             quota: Mutex::new(Vec::new()),
@@ -418,6 +421,37 @@ impl Store {
         )
         .map(|n| n == 1)
         .unwrap_or(false)
+    }
+
+    /// Persist push-mode outbox messages so they survive a restart while
+    /// the peer is unreachable. Key-deduped INSERT OR IGNORE.
+    pub fn outbox_save(&self, msgs: &[(String, u64, String)]) {
+        let db = self.db.lock().unwrap();
+        for (k, ts, text) in msgs {
+            let _ = db.execute(
+                "INSERT OR IGNORE INTO tunnel_outbox (k, ts, text) VALUES (?1, ?2, ?3)",
+                rusqlite::params![k, *ts as i64, text],
+            );
+        }
+    }
+
+    /// Load and clear the persisted outbox (oldest first).
+    pub fn outbox_take(&self) -> Vec<(String, u64, String)> {
+        self.db
+            .lock()
+            .unwrap()
+            .prepare("SELECT k, ts, text FROM tunnel_outbox ORDER BY ts")
+            .and_then(|mut s| {
+                let rows = s.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn outbox_clear(&self) {
+        let _ = self.db.lock().unwrap().execute("DELETE FROM tunnel_outbox", []);
     }
 
     pub fn tunnel_enqueue(&self, origin: &str, sender: &str, text: &str) {

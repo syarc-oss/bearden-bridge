@@ -306,10 +306,23 @@ impl Backend for TunnelBackend {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
-        // Mesh events are pushed in batches between flushes; on restart we
-        // start from "now" (no history replay) but keep the buffer in memory
-        // across push failures.
-        let mut outbox: Vec<RoomEvent> = Vec::new();
+        // Mesh events are pushed in batches between flushes. On restart we
+        // start from "now" (no history replay) but keep the buffer in
+        // memory across push failures — and persist it to the DB so a
+        // restart during a peer outage does not drop queued traffic.
+        let mut outbox: Vec<RoomEvent> = store
+            .outbox_take()
+            .into_iter()
+            .map(|(key, ts, text)| RoomEvent {
+                kind: RoomEventKind::Message,
+                key,
+                ts,
+                text,
+            })
+            .collect();
+        if !outbox.is_empty() {
+            println!("[tunnel] restored {} buffered push msgs from DB", outbox.len());
+        }
         let mut poll_cursor: i64 = 0;
         // Short tick; the flush interval is checked against `last_flush`
         // each tick so runtime config changes take effect without restart.
@@ -398,16 +411,25 @@ impl Backend for TunnelBackend {
                             .send()
                             .await
                         {
-                            Ok(resp) if resp.status().is_success() => outbox.clear(),
+                            Ok(resp) if resp.status().is_success() => {
+                                outbox.clear();
+                                store.outbox_clear();
+                            }
                             Ok(resp) => {
                                 eprintln!("[tunnel] push failed: {}", resp.status());
                                 // 4xx means the peer rejected the batch for
                                 // good: drop it rather than retry forever.
                                 if resp.status().is_client_error() {
                                     outbox.clear();
+                                    store.outbox_clear();
+                                } else {
+                                    store.outbox_save(&outbox.iter().map(|e| (e.key.clone(), e.ts, e.text.clone())).collect::<Vec<_>>());
                                 }
                             }
-                            Err(e) => eprintln!("[tunnel] push error: {e}"),
+                            Err(e) => {
+                                eprintln!("[tunnel] push error: {e}");
+                                store.outbox_save(&outbox.iter().map(|e| (e.key.clone(), e.ts, e.text.clone())).collect::<Vec<_>>());
+                            }
                         }
                     }
                     let sent = run_flush(&store, &serial, &cfg).await;

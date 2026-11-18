@@ -11,6 +11,53 @@ use serialport::SerialPort;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 
+/// One outbound record: everything we hand to the firmware CLI, so GET
+/// /media/tx can show what actually went out on RF (initial bursts, fetch
+/// answers, forwarder floods, announces).
+pub struct TxRec {
+    pub ts: std::time::SystemTime,
+    pub kind: &'static str, // "media" | "fetch" | "text"
+    pub chan: String,
+    pub sid: Option<u32>,
+    pub idx: Option<u8>,
+    pub len: usize,
+    pub text: String, // first chars, for kind == "text"
+}
+
+/// Process-global ring (cap 2000) of outbound serial writes.
+pub static TX_RING: Mutex<std::collections::VecDeque<TxRec>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+const TX_RING_CAP: usize = 2000;
+
+fn tx_record(kind: &'static str, chan: &str, payload: Option<&[u8]>, text: &str) {
+    let mut rec = TxRec {
+        ts: std::time::SystemTime::now(),
+        kind,
+        chan: chan.to_string(),
+        sid: None,
+        idx: None,
+        len: payload.map(|p| p.len()).unwrap_or(text.len()),
+        text: text.chars().take(60).collect(),
+    };
+    if let Some(p) = payload {
+        // Media wire: [0x56/0x57/0x58][sid 4 BE][idx][...]; fetch: [0x72][sid 4 BE][flags]...
+        if p.len() >= 6 {
+            if matches!(p[0], 0x56 | 0x57 | 0x58) {
+                rec.sid = Some(u32::from_be_bytes([p[1], p[2], p[3], p[4]]));
+                rec.idx = Some(p[5]);
+            } else if p[0] == 0x72 {
+                rec.sid = Some(u32::from_be_bytes([p[1], p[2], p[3], p[4]]));
+            }
+        }
+    }
+    let mut ring = TX_RING.lock().unwrap();
+    if ring.len() >= TX_RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(rec);
+}
+
 pub struct SerialLink {
     writer: Mutex<Box<dyn SerialPort>>,
 }
@@ -47,6 +94,8 @@ impl SerialLink {
             anyhow::bail!("media packet too long for CLI line ({} B)", payload.len());
         }
         let b64 = crate::media::b64_encode(payload);
+        let kind = if payload.first() == Some(&0x72) { "fetch" } else { "media" };
+        tx_record(kind, chan, Some(payload), "");
         let mut w = self.writer.lock().unwrap();
         w.write_all(format!("room.media {chan} {b64}\r").as_bytes())?;
         w.flush()?;
@@ -56,6 +105,7 @@ impl SerialLink {
     /// Send a channel TEXT message (e.g. a VE3/VM1/VI1 media announce) via
     /// the firmware `room.text` CLI. `chan` is "bears" or "public".
     pub fn send_text(&self, text: &str, chan: &str) -> Result<()> {
+        tx_record("text", chan, None, text);
         let mut w = self.writer.lock().unwrap();
         w.write_all(format!("room.text {chan} {text}\r").as_bytes())?;
         w.flush()?;
